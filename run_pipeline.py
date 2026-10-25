@@ -444,7 +444,8 @@ def run_rq(args, extra):
                 "--extract_batch_size", str(args.extract_batch_size)]
     elif args.rq_step == "run":
         # Hai flag này run_pipeline đã tự parse nên không nằm trong `extra`; chỉ rq*_run mới nhận.
-        cmd += ["--extract_batch_size", str(args.extract_batch_size)]
+        cmd += ["--extract_batch_size", str(args.extract_batch_size), "--views", args.views,
+                "--quant", args.quant, "--stacker", args.stacker]
         if args.stack_mode is not None:
             cmd += ["--stack_mode", args.stack_mode]
 

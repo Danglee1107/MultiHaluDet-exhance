@@ -14,7 +14,8 @@ Cac thanh phan
   B0  chi do dai (LR, GBM)                 B1  thong ke van phong thu cong (LR, GBM)
   B2  TF-IDF word/char + LR, che do answer-only / question-only / question+answer
   B3  XLM-R fine-tune chi tren answer (tuy chon, can GPU)
-  hs  mo hinh hidden-state cua pipeline (goi lai stage 2/3/4 cua run_pipeline.py, CUNG split/seed)
+  hs  mo hinh hidden-state cua kien truc moi (run_pipeline --feat v2: verify prompt, probe, A/B/C = dieu kien
+      `full` cua RQ1; goi lai stage probe/train_oof/ensemble, CUNG split nhom theo cau hoi + seed, dung lai OOF cua RQ1)
 Thi nghiem co che
   length-bin / length-matched AUROC, complementarity (stack be mat + hidden), residualize
   (loai thanh phan tuyen tinh cua be mat khoi feature hidden roi train lai), perturbation,
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import os
 import random
 import re
@@ -194,19 +196,6 @@ def paired_boot(y, a, b, n=1000, seed=0):
         d.append(fast_auc(y[i], a[i]) - fast_auc(y[i], b[i]))
     d = np.asarray(d)
     return float(d.mean()), float(np.percentile(d, 2.5)), float(np.percentile(d, 97.5))
-
-
-def test_size() -> float:
-    try:
-        from src.config import get_config
-        return get_config().test_size
-    except Exception:  # noqa: BLE001
-        return 0.20
-
-
-def split_indices(y, seed):
-    """Giong het train_test_split trong stage_2_3_train_oof cua run_pipeline.py."""
-    return train_test_split(np.arange(len(y)), test_size=test_size(), stratify=y, random_state=seed)
 
 
 def md_table(df: pd.DataFrame, floatfmt=4) -> str:
@@ -381,9 +370,12 @@ def b3_scores(a_tr, y_tr, a_te, seed, args):
 
 
 # ----------------------------------------------------------------------------------------------
-# Hidden-state model: tai su dung stage 2/3/4 cua run_pipeline.py
+# Hidden-state model: kien truc moi (run_pipeline --feat v2). Cau hinh = dieu kien RQ1 `--hs_cond`
+# (full = bat het A/B/C; base = tat het), lay tu cond_spec cua src/rq/rq1.py de hai RQ dong bo.
+# Tag train/OOF trung voi RQ1 (tr_<sig>_s<seed>) nen feature, probe va OOF cua RQ1 duoc dung lai.
 # ----------------------------------------------------------------------------------------------
 _RP = None
+_R1 = None
 
 
 def _rp():
@@ -394,70 +386,116 @@ def _rp():
     return _RP
 
 
-def hs_namespace(dataset_key, lang, model, tag, stack_mode, bs):
-    return argparse.Namespace(dataset=dataset_key, lang=lang, model=model, tag=tag,
-                              stack_mode=stack_mode, extract_batch_size=bs)
+def _r1():
+    global _R1
+    if _R1 is None:
+        try:
+            import src.rq.rq1 as r1
+        except ImportError as e:
+            raise SystemExit(f"Khong import duoc src/rq/rq1.py ({e}); RQ2 dung cond_spec/ALL_CONDS cua RQ1")
+        _R1 = r1
+    return _R1
 
 
-def hs_stack_mode(args):
-    return args.stack_mode or ("logit" if args.hs_variant == "improved" else "vector")
-
-
-def hs_config(seed, variant):
-    cfg = _rp().get_config()
+def base_cfg(seed):
+    from src.config import get_config
+    cfg = get_config()
     cfg.seed = seed
-    if variant == "improved":  # = --improved cua run_pipeline.py
-        cfg.use_layer_delta = cfg.scale_layer_weights = cfg.use_answer_ll = True
-        cfg.rank_loss_weight = 0.1
     return cfg
 
 
-def ensure_features(dataset_key, lang, model, args, samples=None):
-    """Dam bao results/features/*_{dataset_key}_{lang}_{model}.npy ton tai; tra ve y cua feature."""
+def hs_spec(args):
+    r1 = _r1()
+    comps = r1.ALL_CONDS[args.hs_cond]
+    return r1.cond_spec(comps, args), comps
+
+
+def hs_config(seed, comps):
+    """Giong cach run_pipeline.main() dat config tu cac co cua dieu kien."""
+    cfg = base_cfg(seed)
+    cfg.use_layer_delta = "C_delta" in comps
+    cfg.scale_layer_weights = "C_scale" in comps
+    cfg.rank_loss_weight = _r1().RANK_WEIGHT if "C_rank" in comps else 0.0
+    return cfg
+
+
+def hs_ns(dataset_key, lang, model, seed, spec, args):
+    """Namespace day du cho cac stage v2 cua run_pipeline (stage 2/3/4 doc truc tiep args.<ten>)."""
+    prefix = "rq2_" if args.no_reuse else ""      # --no_reuse: khong ghi de OOF cua RQ1
+    return argparse.Namespace(
+        dataset=dataset_key, lang=lang, model=model, tag=f"{prefix}tr_{spec['sig']}_s{seed}",
+        feat="v2", prompt_mode=spec["pm"], views=args.views, quant=args.quant,
+        probe_use=spec["probe"], glob_use=",".join(spec["glob"]), pair_center=False, group_split=True,
+        redo_probe=False, stacker=args.stacker, stack_mode=args.stack_mode or spec["stack"],
+        extract_batch_size=args.extract_batch_size, seed=seed)
+
+
+def feat_dir(ns) -> Path:
+    return Path(_rp()._feat_dir2(ns))
+
+
+def ensure_features_v2(ns, args, cfg, samples=None):
+    """Dam bao results/features_v2/<ds>_<lang>_<model>_<prompt>/ da trich xong (views khop --views)."""
     rp = _rp()
-    key = f"{dataset_key}_{lang}_{model}"
-    if not Path(f"results/features/X_seq_{key}.npy").exists():
-        print(f"[hs] trich feature {key} ...", flush=True)
-        if samples is not None:
-            # stage_1_extract doc dataset khac 'halueval' qua load_triviaqa -> thay bang mau da perturb
-            rp.load_triviaqa = lambda lang="en", seed=42, max_samples=10000: samples
-        rp.stage_1_extract(hs_namespace(dataset_key, lang, model, "", "logit", args.extract_batch_size),
-                           rp.get_config())
-    return np.load(f"results/features/y_{key}.npy")
+    d = feat_dir(ns)
+    views = [v.strip() for v in args.views.split(",") if v.strip()]
+    if (d / "y.npy").exists() and (d / "meta.json").exists():
+        have = json.loads((d / "meta.json").read_text())["views"]
+        if have != views:
+            raise RuntimeError(f"{d}: views da trich {have} != --views {views}")
+        return
+    print(f"[hs] trich feature v2 {d.name} ...", flush=True)
+    orig = rp._load_samples
+    if samples is not None:     # dataset 'halueval-p-*' / 'halueval-resid*' khong co loader rieng
+        rp._load_samples = lambda a, c: samples
+    try:
+        rp.stage_1_extract_v2(ns, cfg)
+    finally:
+        rp._load_samples = orig
 
 
-def _hs_cache(ns):
+def get_split(ns, cfg, samples, use_feat):
+    """Split cua pipeline v2: bo hang extraction loi (valid), GroupShuffleSplit theo cau hoi.
+    Khong co feature (--skip hs) thi gia dinh moi hang deu hop le -> co the lech split cua hs neu extraction co hang loi."""
+    if use_feat:
+        d, keep, y, groups, tr, te = _rp()._v2_context(ns, cfg)
+        return dict(keep=keep, y=y, groups=groups, tr=tr, te=te)
+    from src.data.splits import make_groups, outer_split
+    y = np.array([int(s["is_hallucination"]) for s in samples])
+    groups = make_groups(samples)
+    tr, te = outer_split(y, groups, cfg.test_size, cfg.seed, True)
+    return dict(keep=np.arange(len(y)), y=y, groups=groups, tr=tr, te=te)
+
+
+def hs_cache_path(ns, args):
     key = _rp()._key(ns)
-    return key, RESULTS / "_cache" / f"hs_{key}.npz"
+    return key, RESULTS / "_cache" / f"hs_{key}_{ns.stacker}_{ns.stack_mode}.npz"
 
 
-def hs_is_cached(dataset_key, lang, model, seed, args):
-    ns = hs_namespace(dataset_key, lang, model, f"rq2_{args.hs_variant}_s{seed}", hs_stack_mode(args),
-                      args.extract_batch_size)
-    return _hs_cache(ns)[1].exists() and not args.no_reuse
+def hs_is_cached(ns, args):
+    return hs_cache_path(ns, args)[1].exists() and not args.no_reuse
 
 
-def run_hs(dataset_key, lang, model, seed, args, expected_y_test):
-    """Train (hoac doc cache) mo hinh hidden-state cho 1 seed. Tra ve final (stacker), deep, oof."""
+def run_hs(ns, cfg, spec, args, y_exp, g_exp):
+    """Probe -> train_oof -> ensemble cua pipeline v2 cho 1 seed (hoac doc cache).
+    Tra ve dict: final (xac suat stacker), deep (logit TB 5 fold net), oof (logit OOF train), y_train, y_test, g_test."""
     rp = _rp()
-    stack = hs_stack_mode(args)
-    ns = hs_namespace(dataset_key, lang, model, f"rq2_{args.hs_variant}_s{seed}", stack,
-                      args.extract_batch_size)
-    key, cache = _hs_cache(ns)
+    key, cache = hs_cache_path(ns, args)
     cache.parent.mkdir(parents=True, exist_ok=True)
     if cache.exists() and not args.no_reuse:
         d = np.load(cache)
         out = {k: d[k] for k in d.files}
         print(f"  [hs] doc cache {cache.name}", flush=True)
     else:
-        cfg = hs_config(seed, args.hs_variant)
-        seed_all(seed)
-        needed = ["oof_logits", "test_logits", "X_glob_train", "X_glob_test", "y_train", "y_test"]
-        needed += ["X_train_deep", "X_test_deep"] if stack == "vector" else []
-        if args.no_reuse or not all(Path(f"results/oof/{n}_{key}.npy").exists() for n in needed):
+        if spec["probe"] != "none":
+            rp.stage_2_probe(ns, cfg)           # dung lai file probe neu da co (RQ1 da tao)
+        needed = ["oof_logits", "test_logits", "X_glob_train", "X_glob_test", "y_train", "y_test", "g_train", "g_test"]
+        if ns.stack_mode == "vector":
+            needed += ["X_train_deep", "X_test_deep"]
+        if not all(Path(f"results/oof/{n}_{key}.npy").exists() for n in needed):
             rp.stage_2_3_train_oof(ns, cfg)
         cap, orig = {}, rp.plot_publication_results
-        # stage_4_ensemble khong tra ve xac suat -> bat lai tham so dau tien cua ham ve hinh
+        # stage_4_ensemble khong tra ve xac suat -> bat lai tham so dau cua ham ve hinh
         rp.plot_publication_results = lambda probs, labels, *a, **k: cap.update(
             probs=np.asarray(probs), y=np.asarray(labels))
         try:
@@ -465,50 +503,67 @@ def run_hs(dataset_key, lang, model, seed, args, expected_y_test):
         finally:
             rp.plot_publication_results = orig
         if "probs" not in cap:
-            raise RuntimeError(f"stage 4 khong tao ra xac suat cho {key} (thieu feature/OOF?)")
+            raise RuntimeError(f"stage 4 khong tao ra xac suat cho {key} (thieu feature/probe/OOF?)")
         out = dict(final=cap["probs"],
                    deep=np.load(f"results/oof/test_logits_{key}.npy").mean(0),
                    oof=np.load(f"results/oof/oof_logits_{key}.npy"),
                    y_train=np.load(f"results/oof/y_train_{key}.npy"),
-                   y_test=np.load(f"results/oof/y_test_{key}.npy"))
+                   y_test=np.load(f"results/oof/y_test_{key}.npy"),
+                   g_test=np.load(f"results/oof/g_test_{key}.npy"))
         np.savez(cache, **out)
-    if not np.array_equal(out["y_test"], expected_y_test):
+    if not (np.array_equal(out["y_test"], y_exp) and np.array_equal(out["g_test"], g_exp)):
         raise RuntimeError("tap test cua pipeline khac split cua RQ2 -> khong so sanh cung split duoc")
     return out
 
 
-def write_resid_features(Z, tr, te, lang, model, seed, ridge=1.0):
-    """Hoi quy (ridge, fit CHI tren train) moi cot feature hidden theo feature be mat roi tru di.
-    Ghi ra results/features duoi ten dataset 'halueval-resid<seed>' de stage 2/3 doc nhu binh thuong."""
-    src = f"halueval_{lang}_{model}"
-    Xs = np.load(f"results/features/X_seq_{src}.npy")
-    Xg = np.load(f"results/features/X_glob_{src}.npy")
-    y = np.load(f"results/features/y_{src}.npy")
-    N, L, F = Xs.shape
-    X = np.nan_to_num(np.concatenate([Xs.reshape(N, -1), Xg], axis=1).astype(np.float64))
+def write_resid_v2(Z, fit_rows, test_rows, ns_src, ns_dst, ridge=1.0):
+    """Residualize feature v2: hoi quy ridge (fit CHI tren hang train hop le) tung chieu cua hidden state
+    (H_<view>, tung layer), seq.npy va glob.npy theo feature be mat roi tru di. Ghi vao thu muc feature
+    moi (cung N/valid/groups/y nen split giong het). fit_rows/test_rows la chi so hang THO (truoc keep)."""
+    import shutil
+    from numpy.lib.format import open_memmap
+    src, dst = feat_dir(ns_src), feat_dir(ns_dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    meta = json.loads((src / "meta.json").read_text())
+    N, L = meta["N"], meta["L"]
     lt = np.log1p(Z[:, I_TOK])
     Zf = np.column_stack([Z, np.log1p(Z), lt ** 2, lt ** 3])
-    Zs = StandardScaler().fit(Zf[tr]).transform(Zf)
-    mu = X[tr].mean(0)
-    coef = np.linalg.solve(Zs[tr].T @ Zs[tr] + ridge * np.eye(Zs.shape[1]), Zs[tr].T @ (X[tr] - mu))
-    R = X - mu - Zs @ coef
-    Xt = X[te]
-    ss_res = (R[te] ** 2).sum(0)
-    ss_tot = ((Xt - Xt.mean(0)) ** 2).sum(0)
-    r2 = float(np.mean(1 - ss_res / np.maximum(ss_tot, 1e-12)))
-    ds = f"halueval-resid{seed}"
-    rk = f"{ds}_{lang}_{model}"
-    np.save(f"results/features/X_seq_{rk}.npy", R[:, :L * F].reshape(N, L, F).astype(np.float32))
-    np.save(f"results/features/X_glob_{rk}.npy", R[:, L * F:].astype(np.float32))
-    np.save(f"results/features/y_{rk}.npy", y)
-    return ds, r2
+    Zs = StandardScaler().fit(Zf[fit_rows]).transform(Zf).astype(np.float32)
+    A = Zs[fit_rows].astype(np.float64)
+    P = np.linalg.solve(A.T @ A + ridge * np.eye(A.shape[1]), A.T).astype(np.float32)   # [p, n_fit]
+
+    def resid(X):
+        mu = X[fit_rows].mean(0)
+        coef = P @ (X[fit_rows] - mu)
+        R = X - mu - Zs @ coef
+        Xt = X[test_rows]
+        r2 = 1 - (R[test_rows] ** 2).sum(0) / np.maximum(((Xt - Xt.mean(0)) ** 2).sum(0), 1e-12)
+        return R, float(np.mean(r2))
+
+    r2s = []
+    for v in meta["views"]:
+        Hs = np.load(src / f"H_{v}.npy", mmap_mode="r")
+        Hd = open_memmap(dst / f"H_{v}.npy", mode="w+", dtype=np.float16, shape=Hs.shape)
+        for l in range(L):
+            R, r2 = resid(np.asarray(Hs[l], dtype=np.float32))
+            Hd[l] = R.astype(np.float16)
+            r2s.append(r2)
+        Hd.flush()
+        del Hd, Hs
+    seq, glob = np.load(src / "seq.npy"), np.load(src / "glob.npy")
+    X = np.nan_to_num(np.concatenate([seq.reshape(N, -1), glob], axis=1)).astype(np.float32)
+    R, r2_stats = resid(X)
+    k = int(np.prod(seq.shape[1:]))
+    np.save(dst / "seq.npy", R[:, :k].reshape(seq.shape).astype(np.float32))
+    np.save(dst / "glob.npy", R[:, k:].astype(np.float32))
+    for f in ("y.npy", "groups.npy", "valid.npy", "meta.json"):
+        shutil.copy2(src / f, dst / f)
+    return dict(mean_r2_hidden_test=float(np.mean(r2s)), mean_r2_stats_test=r2_stats)
 
 
-def cleanup_resid(ds, lang, model):
-    for p in ("X_seq", "X_glob", "y"):
-        f = Path(f"results/features/{p}_{ds}_{lang}_{model}.npy")
-        if f.exists():
-            f.unlink()
+def cleanup_resid(ns):
+    import shutil
+    shutil.rmtree(feat_dir(ns), ignore_errors=True)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -576,6 +631,7 @@ def complementarity(Z, tr, te, y, hs, seed, boot):
 # ----------------------------------------------------------------------------------------------
 def run_combo(args, model, lang):
     from src.data.loader import load_halueval
+    from src.data.splits import pair_accuracy
 
     out = RESULTS / f"halueval_{lang}_{model}"
     out.mkdir(parents=True, exist_ok=True)
@@ -588,11 +644,16 @@ def run_combo(args, model, lang):
           flush=True)
 
     use_hs = "hs" not in args.skip
+    spec = comps = None
     if use_hs:
-        y_feat = ensure_features("halueval", lang, model, args)
+        spec, comps = hs_spec(args)
+        print(f"[hs] cond={args.hs_cond} prompt={spec['pm']} glob={'+'.join(spec['glob'])} probe={spec['probe']} "
+              f"stack={args.stack_mode or spec['stack']} sig={spec['sig']}", flush=True)
+        ns0 = hs_ns("halueval", lang, model, args.seeds[0], spec, args)
+        ensure_features_v2(ns0, args, hs_config(args.seeds[0], comps))
+        y_feat = np.load(feat_dir(ns0) / "y.npy")
         if len(y_feat) != len(y) or not np.array_equal(y_feat, y):
-            print(f"[error] feature da trich ({len(y_feat)}) khong khop mau ({len(y)}) "
-                  f"(co batch bi bo qua?). Bo qua to hop nay.", flush=True)
+            print(f"[error] feature da trich ({len(y_feat)}) khong khop mau ({len(y)}). Bo qua to hop nay.", flush=True)
             return False
 
     count_tokens = make_token_counter(model)
@@ -602,33 +663,38 @@ def run_combo(args, model, lang):
     for p in perts:
         Ap[p] = apply_perturbation(p, A)
         Zp[p] = surface_features(Q, Ap[p], lang, count_tokens)
+    Qa, Aa = np.asarray(Q, dtype=object), np.asarray(A, dtype=object)
 
-    # Chan doan ro ri cau hoi giua train/test (split cua pipeline chi stratify theo nhan)
-    tr0, te0 = split_indices(y, args.seeds[0])
-    q_tr = set(Q[i] for i in tr0)
-    both_cls = pd.DataFrame({"q": Q, "y": y}).groupby("q")["y"].nunique()
-    overlap = dict(n_unique_questions=len(set(Q)), n_samples=len(Q),
-                   test_questions_seen_in_train=float(np.mean([Q[i] in q_tr for i in te0])),
-                   questions_with_both_labels=float((both_cls > 1).mean()))
-    pd.Series(overlap).to_csv(out / "split_overlap.csv", header=["value"])
-    print(f"[split] {overlap}", flush=True)
-
+    overlap = None
     rows, bin_rows, comp_rows, imp_rows, pert_rows, single_rows, r2_rows = [], [], [], [], [], [], []
     for seed in args.seeds:
         t0 = time.perf_counter()
         print(f"\n--- seed {seed} ---", flush=True)
         seed_all(seed)
-        tr, te = split_indices(y, seed)
-        ytr, yte = y[tr], y[te]
-        preds, extras = baseline_scores(Z, Q, A, tr, te, y, seed, full=True, want_b2="b2" not in args.skip)
+        cfg = hs_config(seed, comps) if use_hs else base_cfg(seed)
+        ns = hs_ns("halueval", lang, model, seed, spec, args) if use_hs else None
+        sp = get_split(ns, cfg, samples, use_hs)
+        keep, tr, te, yk, gk = sp["keep"], sp["tr"], sp["te"], sp["y"], sp["groups"]
+        Zk, Qk, Ak = Z[keep], Qa[keep], Aa[keep]
+        ytr, yte, gte = yk[tr], yk[te], gk[te]
+        if overlap is None:     # split theo cau hoi -> test_questions_seen_in_train phai = 0
+            both_cls = pd.DataFrame({"q": gk, "y": yk}).groupby("q")["y"].nunique()
+            overlap = dict(n_unique_questions=len(set(Q)), n_samples=len(Q), n_kept=len(keep),
+                           n_train=len(tr), n_test=len(te),
+                           test_questions_seen_in_train=float(np.isin(gk[te], gk[tr]).mean()),
+                           questions_with_both_labels=float((both_cls > 1).mean()))
+            pd.Series(overlap).to_csv(out / "split_overlap.csv", header=["value"])
+            print(f"[split] {overlap}", flush=True)
+
+        preds, extras = baseline_scores(Zk, Qk, Ak, tr, te, yk, seed, full=True, want_b2="b2" not in args.skip)
 
         for j, c in enumerate(ALL_COLS):  # AUROC co dau cua tung feature don le (>0.5: cang lon -> hallucination)
-            single_rows.append(dict(seed=seed, feature=c, auc=fast_auc(yte, Z[te][:, j]) if Z[te][:, j].std() > 0 else np.nan))
-        for k, df in extras.items():
+            single_rows.append(dict(seed=seed, feature=c, auc=fast_auc(yte, Zk[te][:, j]) if Zk[te][:, j].std() > 0 else np.nan))
+        for k, df_ in extras.items():
             if k.startswith("top_"):
-                df.to_csv(out / f"top_ngrams_answer_{k[4:]}_seed{seed}.csv", index=False)
+                df_.to_csv(out / f"top_ngrams_answer_{k[4:]}_seed{seed}.csv", index=False)
         if "importance" not in args.skip:
-            d = b1_importance(extras["b1_gbm_model"], Z[te], yte, seed)
+            d = b1_importance(extras["b1_gbm_model"], Zk[te], yte, seed)
             d.insert(0, "seed", seed)
             imp_rows.append(d)
             # he so LR da chuan hoa cua B1
@@ -636,51 +702,54 @@ def run_combo(args, model, lang):
             imp_rows.append(pd.DataFrame({"seed": seed, "feature": ALL_COLS, "lr_coef": lr.coef_[0]}))
 
         if "b3" not in args.skip:
-            preds["b3_xlmr"], val_auc = b3_scores([A[i] for i in tr], ytr, [A[i] for i in te], seed, args)
+            preds["b3_xlmr"], val_auc = b3_scores(list(Ak[tr]), ytr, list(Ak[te]), seed, args)
             print(f"  b3 test AUROC {fast_auc(yte, preds['b3_xlmr']):.4f} (val {val_auc:.4f})", flush=True)
 
         hs = None
         if use_hs:
-            hs = run_hs("halueval", lang, model, seed, args, yte)
+            hs = run_hs(ns, cfg, spec, args, yte, gte)
             preds["hs_final"], preds["hs_deep"] = hs["final"], hs["deep"]
             if "complement" not in args.skip:
-                cdf, cscores = complementarity(Z, tr, te, y, hs, seed, args.boot)
+                cdf, cscores = complementarity(Zk, tr, te, yk, hs, seed, args.boot)
                 comp_rows.append(cdf)
                 preds.update(cscores)
             if "resid" not in args.skip:
-                ds = f"halueval-resid{seed}"
-                if not hs_is_cached(ds, lang, model, seed, args):
-                    ds, r2 = write_resid_features(Z, tr, te, lang, model, seed)
-                    r2_rows.append(dict(seed=seed, mean_r2_surface_to_hidden_test=r2))
-                    print(f"  [resid] R^2 trung binh cua feature hidden giai thich boi be mat (test): {r2:.3f}", flush=True)
-                rh = run_hs(ds, lang, model, seed, args, yte)
+                ns_r = hs_ns(f"halueval-resid{seed}", lang, model, seed, spec, args)
+                if not hs_is_cached(ns_r, args):
+                    info = write_resid_v2(Z, keep[tr], keep[te], ns, ns_r)
+                    r2_rows.append(dict(seed=seed, **info))
+                    print(f"  [resid] R^2 trung binh tren test: hidden {info['mean_r2_hidden_test']:.3f}, "
+                          f"seq/glob {info['mean_r2_stats_test']:.3f}", flush=True)
+                rh = run_hs(ns_r, cfg, spec, args, yte, gte)
                 preds["hs_final_resid"], preds["hs_deep_resid"] = rh["final"], rh["deep"]
                 if not args.keep_tmp:
-                    cleanup_resid(ds, lang, model)
+                    cleanup_resid(ns_r)
 
         for name, s in preds.items():
-            rows.append(dict(seed=seed, name=name, auc=fast_auc(yte, s)))
+            rows.append(dict(seed=seed, name=name, auc=fast_auc(yte, s), pair_acc=pair_accuracy(s, yte, gte)[0]))
 
         if "perturb" not in args.skip:
             for p in perts:
-                pp, _ = baseline_scores(Zp[p], Q, Ap[p], tr, te, y, seed, full=False, want_b2="b2" not in args.skip)
+                Apk = np.asarray(Ap[p], dtype=object)[keep]
+                pp, _ = baseline_scores(Zp[p][keep], Qk, Apk, tr, te, yk, seed, full=False, want_b2="b2" not in args.skip)
                 if args.perturb_b3 and "b3" not in args.skip:
-                    pp["b3_xlmr"] = b3_scores([Ap[p][i] for i in tr], ytr, [Ap[p][i] for i in te], seed, args)[0]
+                    pp["b3_xlmr"] = b3_scores(list(Apk[tr]), ytr, list(Apk[te]), seed, args)[0]
                 for name, s in pp.items():
                     pert_rows.append(dict(seed=seed, perturbation=p, name=name, auc=fast_auc(yte, s)))
             for p in (args.hs_perturb if use_hs else []):
-                ds = f"halueval-p-{p}"
-                ensure_features(ds, lang, model, args, samples=[
-                    {**s_, "answer": a_} for s_, a_ in zip(samples, apply_perturbation(p, A))])
-                ph = run_hs(ds, lang, model, seed, args, yte)
+                ns_p = hs_ns(f"halueval-p-{p}", lang, model, seed, spec, args)
+                if not hs_is_cached(ns_p, args):
+                    ensure_features_v2(ns_p, args, cfg, samples=[
+                        {**s_, "answer": a_} for s_, a_ in zip(samples, apply_perturbation(p, A))])
+                ph = run_hs(ns_p, cfg, spec, args, yte, gte)
                 pert_rows.append(dict(seed=seed, perturbation=p, name="hs_final", auc=fast_auc(yte, ph["final"])))
                 pert_rows.append(dict(seed=seed, perturbation=p, name="hs_deep", auc=fast_auc(yte, ph["deep"])))
 
         bin_models = [m for m in ["b0_gbm", "b1_gbm", "b2_answer_word", "b2_answer_char", "b3_xlmr",
                                   "hs_final", "hs_deep", "hs_final_resid"] if m in preds]
-        bin_rows.append(length_analysis(yte, Z[te][:, I_TOK], {m: preds[m] for m in bin_models},
+        bin_rows.append(length_analysis(yte, Zk[te][:, I_TOK], {m: preds[m] for m in bin_models},
                                         args.n_bins, seed))
-        np.savez(out / f"preds_seed{seed}.npz", te_idx=te, y_test=yte, **preds)
+        np.savez(out / f"preds_seed{seed}.npz", te_idx=te, raw_idx=keep[te], y_test=yte, g_test=gte, **preds)
         line = " | ".join(f"{n} {fast_auc(yte, s):.4f}" for n, s in preds.items() if not n.startswith("comp_"))
         print(f"  [seed {seed}] {line}  ({time.perf_counter() - t0:.0f}s)", flush=True)
 
@@ -708,6 +777,8 @@ def run_combo(args, model, lang):
 def write_summary(out: Path, df, overlap, model, lang, args):
     pv = df.pivot(index="seed", columns="name", values="auc")
     agg = pd.DataFrame({"mean": pv.mean(), "std": pv.std(ddof=1), "n": pv.count()})
+    if "pair_acc" in df:
+        agg["pair_acc_mean"] = df.pivot(index="seed", columns="name", values="pair_acc").mean()
     lines = [f"# RQ2 | halueval | {lang} | {model} | seeds {list(pv.index)}\n"]
     if "hs_final" in pv:
         frac = pv.sub(0.5).div(pv["hs_final"] - 0.5, axis=0)
@@ -782,7 +853,11 @@ def parse_args(argv=None):
     ap.add_argument("--dry_run", action="store_true")
     ap.add_argument("--skip", nargs="*", default=[], choices=SKIPPABLE,
                     help="Bo qua thanh phan: b2 b3 hs resid complement perturb importance")
-    ap.add_argument("--hs_variant", default="improved", choices=["improved", "base"])
+    ap.add_argument("--hs_cond", default="full", choices=["full", "base"],
+                    help="Cau hinh mo hinh hidden-state = dieu kien RQ1: full (bat het A/B/C) hoac base (tat het)")
+    ap.add_argument("--views", default="last,amean", help="Phai khop --views luc extraction v2 / RQ1")
+    ap.add_argument("--quant", default="4bit", choices=["4bit", "8bit", "fp16"])
+    ap.add_argument("--stacker", default="full", choices=["full", "lite"])
     ap.add_argument("--no_reuse", action="store_true", help="Train lai hidden-state model, khong dung OOF/cache cu")
     ap.add_argument("--keep_tmp", action="store_true", help="Giu feature residualized trong results/features")
     ap.add_argument("--boot", type=int, default=1000, help="So lan bootstrap cho complementarity")
@@ -809,7 +884,7 @@ def main(argv=None):
         return 0
     RESULTS.mkdir(parents=True, exist_ok=True)
     print(f"[rq2] models={args.models} langs={args.langs} seeds={args.seeds} skip={args.skip} "
-          f"hs_variant={args.hs_variant} perturb={args.perturb} hs_perturb={args.hs_perturb}", flush=True)
+          f"hs_cond={args.hs_cond} perturb={args.perturb} hs_perturb={args.hs_perturb}", flush=True)
     if args.dry_run:
         print("[rq2] --dry_run: dung o day, khong chay gi.", flush=True)
         return 0
