@@ -5,7 +5,7 @@
 set -eo pipefail
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-DATASET=${DATASET:-halueval}
+DATASET=${DATASET:-triviaqa}
 LANGS=(en fr vi bn)
 MODELS=(mistral-7b llama2-7b)
 SEEDS=(1 11 29 37 43)

@@ -40,6 +40,22 @@ RQ_GRID = {
 }
 
 
+GLOB_GROUPS = {"base": "base_", "ll": "ans_", "yn": "v_"}   # nhóm cột global v2 -> tiền tố trong glob_names
+
+
+def _select_glob(X_glob, names, use):
+    """Giữ các nhóm cột global v2 trong `use` (base: 30 cột v1; ll: 13 cột answer-LL/PMI; yn: 3 cột Yes/No)."""
+    groups = [g.strip() for g in use.split(",") if g.strip()]
+    bad = [g for g in groups if g not in GLOB_GROUPS]
+    if bad:
+        raise SystemExit(f"--glob_use: nhóm không hợp lệ {bad}; chọn từ {list(GLOB_GROUPS)}")
+    prefixes = tuple(GLOB_GROUPS[g] for g in groups)
+    cols = [i for i, n in enumerate(names) if n.startswith(prefixes)]
+    if not cols:
+        raise SystemExit(f"--glob_use {use} không chọn được cột nào")
+    return X_glob[:, cols]
+
+
 def _opt(args, name, default):
     """args.<name>, or default when the caller (e.g. an src/rq script) built args without it."""
     return getattr(args, name, default)
@@ -186,6 +202,7 @@ def _load_training_data(args, config):
     if feat == "v2":
         d, keep, y, groups, tr, te = _v2_context(args, config)
         X_seq, X_glob = d["seq"][keep], d["glob"][keep]
+        X_glob = _select_glob(X_glob, d["meta"]["glob_names"], _opt(args, "glob_use", "base,ll,yn"))
         if pair_center:
             X_seq, X_glob = center_by_group(X_seq, groups), center_by_group(X_glob, groups)
         use = args.probe_use
@@ -397,7 +414,9 @@ def run_rq(args, extra):
     --models/--langs/--datasets/--seeds đưa thẳng vào `extra` luôn được ưu tiên hơn.
     """
     root = Path(__file__).resolve().parent
-    script = root / "src" / "rq" / f"rq{args.rq}_{args.rq_step}.py"
+    # RQ viết trong MỘT file src/rq/rq<N>.py (nhận --step) thì ưu tiên; không có thì dùng rq<N>_<step>.py như cũ.
+    single = root / "src" / "rq" / f"rq{args.rq}.py"
+    script = single if single.exists() else root / "src" / "rq" / f"rq{args.rq}_{args.rq_step}.py"
     if not script.exists():
         sys.exit(f"Chưa có {script.relative_to(root)} (RQ{args.rq} bước '{args.rq_step}').")
 
@@ -412,11 +431,18 @@ def run_rq(args, extra):
     if args.rq_step == "collect":
         grid.pop("seeds", None)  # rq*_collect không có --seeds
 
-    cmd = [sys.executable, str(script), *extra]
+    cmd = [sys.executable, str(script)]
+    if script == single:
+        cmd += ["--step", args.rq_step]
+    cmd += extra
     for key, vals in grid.items():
         if f"--{key}" not in extra:
             cmd += [f"--{key}", *map(str, vals)]
-    if args.rq_step == "run":
+    if script == single:
+        # run_pipeline đã tự parse các flag này nên không nằm trong `extra`; file RQ đơn cần cả ba (collect cần --views).
+        cmd += ["--views", args.views, "--quant", args.quant, "--stacker", args.stacker,
+                "--extract_batch_size", str(args.extract_batch_size)]
+    elif args.rq_step == "run":
         # Hai flag này run_pipeline đã tự parse nên không nằm trong `extra`; chỉ rq*_run mới nhận.
         cmd += ["--extract_batch_size", str(args.extract_batch_size)]
         if args.stack_mode is not None:
@@ -517,6 +543,9 @@ def main():
                         help="Precision of the LLM during extraction (8bit/fp16 need more GPU memory)")
     parser.add_argument("--probe_use", type=str, default="both", choices=["both", "seq", "glob", "none"],
                         help="v2: where the probe logits go: sequential channels, global summaries, both, or nowhere (ablation)")
+    parser.add_argument("--glob_use", type=str, default="base,ll,yn",
+                        help="v2: nhóm cột global đưa vào mô hình, cách nhau bằng dấu phẩy, từ base (30 cột v1), "
+                             "ll (13 cột answer-LL/PMI), yn (3 cột Yes/No, chỉ có với --prompt_mode verify); dùng cho ablation RQ1")
     parser.add_argument("--pca_dim", type=int, default=None, help="PCA dimension of each probe (default config: 256)")
     parser.add_argument("--probe_C", type=float, default=None, help="Inverse L2 strength of each probe (default config: 0.02)")
     parser.add_argument("--probe_jobs", type=int, default=None, help="Probes fitted in parallel (default config: 4)")
