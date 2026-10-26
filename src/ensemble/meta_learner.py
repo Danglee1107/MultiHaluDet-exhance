@@ -13,7 +13,7 @@ import xgboost as xgb
 import lightgbm as lgb
 
 # Classifiers that use one core per fit; their 6 fits run in separate processes.
-SINGLE_CORE = {'svm'}
+SINGLE_CORE = {'svm', 'lr'}
 
 def _log_odds(clf, X):
     """Meta-learner input: the SVC margin as it is, the logit of the probability otherwise."""
